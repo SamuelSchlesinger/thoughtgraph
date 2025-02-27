@@ -339,7 +339,7 @@ thoughts -f ~/Dropbox/thoughts.bin create --id new-thought
 
 ## License
 
-[License information]
+ThoughtGraph is MIT licensed.
 
 ## Contributing
 
