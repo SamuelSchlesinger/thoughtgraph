@@ -17,6 +17,7 @@ tempfile = "3.8"
 anyhow = "1.0"
 thiserror = "1.0"
 dirs = "5.0"
+regex = "1.10"
 
 [[bin]]
 name = "thoughts"

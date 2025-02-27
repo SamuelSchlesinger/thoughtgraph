@@ -316,7 +316,19 @@ fn create_thought(
         refs,
     )?;
     
+    // Process any auto-references in the format [thought_id]
+    let auto_refs = graph.process_auto_references(&thought_id)?;
+    
     println!("Created thought '{}' successfully", id.green());
+    
+    // Report any auto-references that were added
+    if !auto_refs.is_empty() {
+        println!("Auto-added references to:");
+        for ref_id in auto_refs {
+            println!("  → {}", ref_id.id.blue());
+        }
+    }
+    
     Ok(())
 }
 
@@ -511,7 +523,19 @@ fn edit_thought(graph: &mut ThoughtGraph, id: &str) -> Result<()> {
         thought: updated_thought,
     });
     
+    // Process any auto-references in the format [thought_id]
+    let auto_refs = graph.process_auto_references(&thought_id)?;
+    
     println!("Thought '{}' updated successfully", id.green());
+    
+    // Report any auto-references that were added
+    if !auto_refs.is_empty() {
+        println!("Auto-added references to:");
+        for ref_id in auto_refs {
+            println!("  → {}", ref_id.id.blue());
+        }
+    }
+    
     Ok(())
 }
 

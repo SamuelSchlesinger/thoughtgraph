@@ -299,6 +299,21 @@ impl Thought {
             self.updated_at = Utc::now();
         }
     }
+    
+    /// Extract thought references from content in the format [thought_id]
+    /// Returns a vector of ThoughtIDs that were found in the content
+    pub fn extract_references_from_content(&self) -> Vec<ThoughtID> {
+        let mut found_refs = Vec::new();
+        let re = regex::Regex::new(r"\[([a-zA-Z0-9_-]+)\]").unwrap();
+        
+        for cap in re.captures_iter(&self.contents) {
+            if let Some(thought_id) = cap.get(1) {
+                found_refs.push(ThoughtID::new(thought_id.as_str().to_string()));
+            }
+        }
+        
+        found_refs
+    }
 }
 
 /// Unique identifier for a tag in the graph.
@@ -749,6 +764,47 @@ impl ThoughtGraph {
         self.thoughts.get(&id).ok_or_else(|| ThoughtGraphError::ThoughtNotFound(id.id.clone()))
     }
     
+    /// Process automatic references from content (in [thought_id] format)
+    /// and add them to the thought's references
+    pub fn process_auto_references(&mut self, thought_id: &ThoughtID) -> Result<Vec<ThoughtID>> {
+        let mut added_refs = Vec::new();
+        
+        // Clone the thought to extract references
+        if let Some(thought) = self.thoughts.get(thought_id).cloned() {
+            let content_refs = thought.extract_references_from_content();
+            
+            // Create updated thought with new references
+            let mut updated_thought = thought;
+            
+            for ref_id in &content_refs {
+                // Skip self-references and already existing references
+                if ref_id == thought_id || updated_thought.references.iter().any(|r| &r.id == ref_id) {
+                    continue;
+                }
+                
+                // Only add reference if the target thought exists
+                if self.thoughts.contains_key(ref_id) {
+                    updated_thought.add_reference(Reference::new(
+                        ref_id.clone(),
+                        format!("Auto-reference from [{}]", ref_id.id),
+                        Utc::now(),
+                    ));
+                    added_refs.push(ref_id.clone());
+                }
+            }
+            
+            // Update the thought with new references
+            if !added_refs.is_empty() {
+                self.command(&Command::PutThought {
+                    id: thought_id.clone(),
+                    thought: updated_thought,
+                });
+            }
+        }
+        
+        Ok(added_refs)
+    }
+    
     /// Create a new tag with the given parameters
     pub fn create_tag(&mut self, id: TagID, description: String) -> Result<&Tag> {
         let tag = Tag::new(description);
@@ -803,6 +859,94 @@ mod tests {
             notes.to_string(),
             Utc::now(),
         )
+    }
+    
+    #[test]
+    fn test_extract_references_from_content() {
+        // Test extracting references from content
+        let thought = Thought::new(
+            Some("Test Thought".to_string()),
+            "This references [thought1] and [thought2] and [invalid-] but not just plain text.".to_string(),
+            vec![],
+            vec![],
+        );
+        
+        let refs = thought.extract_references_from_content();
+        assert_eq!(refs.len(), 3);
+        assert!(refs.contains(&create_thought_id("thought1")));
+        assert!(refs.contains(&create_thought_id("thought2")));
+        assert!(refs.contains(&create_thought_id("invalid-")));
+    }
+    
+    #[test]
+    fn test_auto_references() {
+        // Test automatically adding references from content
+        let mut graph = ThoughtGraph::new();
+        
+        // Create some thoughts first
+        let thought1_id = create_thought_id("thought1");
+        let thought2_id = create_thought_id("thought2");
+        let thought3_id = create_thought_id("thought3");
+        
+        let thought1 = Thought::new(
+            Some("First Thought".to_string()),
+            "This is the first thought.".to_string(),
+            vec![],
+            vec![],
+        );
+        
+        let thought2 = Thought::new(
+            Some("Second Thought".to_string()),
+            "This is the second thought.".to_string(),
+            vec![],
+            vec![],
+        );
+        
+        // Third thought references the first two using [thought_id] format
+        let thought3 = Thought::new(
+            Some("Third Thought".to_string()),
+            "This references [thought1] and [thought2] automatically.".to_string(),
+            vec![],
+            vec![],
+        );
+        
+        graph.command(&Command::PutThought {
+            id: thought1_id.clone(),
+            thought: thought1,
+        });
+        
+        graph.command(&Command::PutThought {
+            id: thought2_id.clone(),
+            thought: thought2,
+        });
+        
+        graph.command(&Command::PutThought {
+            id: thought3_id.clone(),
+            thought: thought3,
+        });
+        
+        // Process auto-references
+        let added_refs = graph.process_auto_references(&thought3_id).unwrap();
+        
+        // Check that references were added
+        assert_eq!(added_refs.len(), 2);
+        assert!(added_refs.contains(&thought1_id));
+        assert!(added_refs.contains(&thought2_id));
+        
+        // Check that the references are in the thought
+        let updated_thought3 = graph.get_thought(&thought3_id).unwrap();
+        assert_eq!(updated_thought3.references.len(), 2);
+        assert!(updated_thought3.references.iter().any(|r| r.id == thought1_id));
+        assert!(updated_thought3.references.iter().any(|r| r.id == thought2_id));
+        
+        // Check that backreferences are correctly set up
+        let backlinks_to_thought1 = graph.get_backlinks(&thought1_id);
+        let backlinks_to_thought2 = graph.get_backlinks(&thought2_id);
+        
+        assert_eq!(backlinks_to_thought1.len(), 1);
+        assert_eq!(backlinks_to_thought2.len(), 1);
+        assert!(backlinks_to_thought1.contains(&thought3_id));
+        assert!(backlinks_to_thought2.contains(&thought3_id));
     }
 
     #[test]
