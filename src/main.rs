@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::NamedTempFile;
 use thoughtgraph::{Reference, Tag, TagID, Thought, ThoughtGraph, ThoughtID};
+use thoughtgraph::visualization::{generate_graph_data, generate_focused_graph};
 
 /// Default filename for the thought graph
 const DEFAULT_FILENAME: &str = "thoughts.bin";
@@ -130,6 +131,25 @@ enum Commands {
 
     /// Initialize a new empty thought graph
     Init,
+    
+    /// Visualize the thought graph
+    Visualize {
+        /// Format for visualization (dot or json)
+        #[arg(short, long, default_value = "dot")]
+        format: String,
+        
+        /// Focus visualization on a specific thought
+        #[arg(short, long)]
+        focus: Option<String>,
+        
+        /// Depth limit for focused visualization (default: 1)
+        #[arg(short, long, default_value = "1")]
+        depth: usize,
+        
+        /// Output file (if not specified, outputs to stdout)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 fn main() -> Result<()> {
@@ -167,6 +187,8 @@ fn main() -> Result<()> {
                 Commands::Reference { from_id, to_id, notes } => add_reference(&mut graph, &from_id, &to_id, notes),
                 Commands::Search { query } => search_thoughts(&graph, &query),
                 Commands::Tags => list_tags(&graph),
+                Commands::Visualize { format, focus, depth, output } => 
+                    visualize_graph(&graph, &format, focus, depth, output),
                 Commands::Init => unreachable!(), // Handled above
             };
             
@@ -747,6 +769,46 @@ fn list_tags(graph: &ThoughtGraph) -> Result<()> {
             tag.description,
             count
         );
+    }
+    
+    Ok(())
+}
+
+/// Visualize the thought graph
+fn visualize_graph(
+    graph: &ThoughtGraph,
+    format: &str,
+    focus: Option<String>,
+    depth: usize,
+    output: Option<PathBuf>,
+) -> Result<()> {
+    // Generate graph data based on whether we have a focused thought or not
+    let graph_data = if let Some(focus_id_str) = focus {
+        let focus_id = ThoughtID::new(focus_id_str.clone());
+        
+        // Check if the focused thought exists
+        if !graph.thoughts.contains_key(&focus_id) {
+            return Err(anyhow::anyhow!("Thought '{}' not found", focus_id_str));
+        }
+        
+        generate_focused_graph(graph, &focus_id, depth)
+    } else {
+        generate_graph_data(graph)
+    };
+    
+    // Generate output in the requested format
+    let output_text = match format.to_lowercase().as_str() {
+        "dot" => graph_data.to_dot(),
+        "json" => graph_data.to_json(),
+        _ => return Err(anyhow::anyhow!("Unsupported visualization format: {}. Use 'dot' or 'json'.", format)),
+    };
+    
+    // Output to file or stdout
+    if let Some(output_path) = output {
+        fs::write(&output_path, output_text)?;
+        println!("Visualization saved to {}", output_path.display());
+    } else {
+        println!("{}", output_text);
     }
     
     Ok(())

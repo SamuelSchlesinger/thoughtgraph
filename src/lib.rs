@@ -89,6 +89,8 @@ use std::io;
 use std::path::Path;
 use thiserror::Error;
 
+pub mod visualization;
+
 /// Error types for ThoughtGraph operations
 #[derive(Error, Debug)]
 pub enum ThoughtGraphError {
@@ -301,7 +303,37 @@ impl Thought {
     }
     
     /// Extract thought references from content in the format [thought_id]
-    /// Returns a vector of ThoughtIDs that were found in the content
+    /// 
+    /// This method scans the thought's content for any text patterns matching the format
+    /// `[thought_id]` and extracts the IDs as potential references to other thoughts.
+    /// This supports the auto-reference feature which allows creating connections between
+    /// thoughts by simply mentioning their IDs in square brackets.
+    ///
+    /// The regex pattern matches alphanumeric characters, underscores, and hyphens between
+    /// square brackets. For example, `[my-thought-123]` would be extracted as a reference
+    /// to the thought with ID "my-thought-123".
+    ///
+    /// # Returns
+    ///
+    /// A vector of ThoughtIDs that were found in the content
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use thoughtgraph::{Thought, ThoughtID};
+    ///
+    /// let thought = Thought::new(
+    ///     Some("Example".to_string()),
+    ///     "This references [thought1] and also [another-thought-2]".to_string(),
+    ///     vec![],
+    ///     vec![],
+    /// );
+    ///
+    /// let refs = thought.extract_references_from_content();
+    /// assert_eq!(refs.len(), 2);
+    /// assert_eq!(refs[0].id, "thought1");
+    /// assert_eq!(refs[1].id, "another-thought-2");
+    /// ```
     pub fn extract_references_from_content(&self) -> Vec<ThoughtID> {
         let mut found_refs = Vec::new();
         let re = regex::Regex::new(r"\[([a-zA-Z0-9_-]+)\]").unwrap();
@@ -765,7 +797,56 @@ impl ThoughtGraph {
     }
     
     /// Process automatic references from content (in [thought_id] format)
-    /// and add them to the thought's references
+    /// and add them to the thought's references.
+    ///
+    /// This function scans the content of a thought for patterns like `[thought_id]`
+    /// and automatically creates references to those thoughts if they exist in the graph.
+    /// It allows users to easily create connections between thoughts by simply mentioning
+    /// their IDs in square brackets within the content.
+    ///
+    /// # Arguments
+    ///
+    /// * `thought_id` - The ID of the thought whose content should be processed for references
+    ///
+    /// # Returns
+    ///
+    /// A Result containing a Vec of ThoughtIDs that were added as references
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use thoughtgraph::{ThoughtGraph, ThoughtID, Thought};
+    ///
+    /// // Create a graph with two thoughts
+    /// let mut graph = ThoughtGraph::new();
+    /// let thought1_id = ThoughtID::new("thought1".to_string());
+    /// let thought2_id = ThoughtID::new("thought2".to_string());
+    ///
+    /// // Add the first thought
+    /// graph.create_thought(
+    ///     thought1_id.clone(),
+    ///     Some("First Thought".to_string()),
+    ///     "This is a standalone thought".to_string(),
+    ///     vec![],
+    ///     vec![],
+    /// ).unwrap();
+    ///
+    /// // Add a second thought that mentions the first one in its content
+    /// graph.create_thought(
+    ///     thought2_id.clone(),
+    ///     Some("Second Thought".to_string()),
+    ///     "This thought references [thought1] using square brackets".to_string(),
+    ///     vec![],
+    ///     vec![],
+    /// ).unwrap();
+    ///
+    /// // Process auto-references in the second thought
+    /// let added_refs = graph.process_auto_references(&thought2_id).unwrap();
+    ///
+    /// // The first thought should now be referenced by the second
+    /// assert_eq!(added_refs.len(), 1);
+    /// assert_eq!(added_refs[0], thought1_id);
+    /// ```
     pub fn process_auto_references(&mut self, thought_id: &ThoughtID) -> Result<Vec<ThoughtID>> {
         let mut added_refs = Vec::new();
         
@@ -826,7 +907,50 @@ impl ThoughtGraph {
         self.tags.keys().collect()
     }
     
-    /// Find thoughts matching a query and return the actual thoughts (not just IDs)
+    /// Find thoughts matching a query and return the actual thoughts (not just IDs).
+    ///
+    /// This is a convenience method that extends the `query` method by returning the
+    /// actual thought objects along with their IDs, rather than just the IDs.
+    ///
+    /// # Arguments
+    ///
+    /// * `query` - The query to execute against the graph
+    ///
+    /// # Returns
+    ///
+    /// A vector of tuples containing thought IDs and their corresponding thought objects
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use thoughtgraph::{ThoughtGraph, ThoughtID, TagID, Thought, Tag, Query, Command};
+    ///
+    /// let mut graph = ThoughtGraph::new();
+    ///
+    /// // Add a tag and a thought
+    /// let tag_id = TagID::new("example".to_string());
+    /// graph.command(&Command::PutTag {
+    ///     id: tag_id.clone(),
+    ///     tag: Tag::new("Example tag".to_string()),
+    /// });
+    ///
+    /// let thought_id = ThoughtID::new("thought1".to_string());
+    /// graph.command(&Command::PutThought {
+    ///     id: thought_id.clone(),
+    ///     thought: Thought::new(
+    ///         Some("Example".to_string()),
+    ///         "Content".to_string(),
+    ///         vec![tag_id.clone()],
+    ///         vec![],
+    ///     ),
+    /// });
+    ///
+    /// // Find thoughts with the tag
+    /// let results = graph.find_thoughts(&Query::Tag(tag_id));
+    /// assert_eq!(results.len(), 1);
+    /// assert_eq!(results[0].0, &thought_id);
+    /// assert_eq!(results[0].1.title, Some("Example".to_string()));
+    /// ```
     pub fn find_thoughts<'a>(&'a self, query: &Query) -> Vec<(&'a ThoughtID, &'a Thought)> {
         self.query(query)
             .iter()
