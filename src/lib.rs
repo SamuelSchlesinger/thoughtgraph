@@ -90,6 +90,7 @@ use std::path::Path;
 use thiserror::Error;
 
 pub mod visualization;
+pub mod ui;
 
 /// Error types for ThoughtGraph operations
 #[derive(Error, Debug)]

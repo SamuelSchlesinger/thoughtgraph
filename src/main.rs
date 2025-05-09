@@ -2,13 +2,16 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use clap::{Parser, Subcommand};
 use colored::*;
+use console::{style, Term};
 use dialoguer::Input;
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write, IsTerminal};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::NamedTempFile;
 use thoughtgraph::{Reference, Tag, TagID, Thought, ThoughtGraph, ThoughtID};
+use thoughtgraph::ui;
 use thoughtgraph::visualization::{generate_graph_data, generate_focused_graph};
 
 /// Default filename for the thought graph
@@ -150,6 +153,287 @@ enum Commands {
         #[arg(short, long)]
         output: Option<PathBuf>,
     },
+    
+    /// Start an interactive CLI session
+    Interactive,
+    
+    /// Browse thoughts interactively
+    Browse,
+}
+
+/// Interactive CLI interface for ThoughtGraph
+fn interactive_mode(file_path: &Path) -> Result<()> {
+    let term = Term::stdout();
+    
+    // Display welcome message
+    term.clear_screen()?;
+    println!("{}", style("Welcome to ThoughtGraph Interactive Mode").bold().cyan());
+    println!("Managing thoughts at: {}", style(file_path.display()).green());
+    println!("");
+    
+    // Load the graph
+    let mut graph = load_or_create_graph(file_path)?;
+    
+    loop {
+        // Display stats
+        let thought_count = graph.thoughts.len();
+        let tag_count = graph.tags.len();
+        println!("\n{} | {} | {}", 
+            style(format!("Thoughts: {}", thought_count)).dim(),
+            style(format!("Tags: {}", tag_count)).dim(),
+            style(format!("File: {}", file_path.display())).dim()
+        );
+        
+        // Show command selector
+        let command_index = ui::command_selector()?;
+        term.clear_screen()?;
+        
+        let result = match command_index {
+            0 => {
+                // Create a new thought
+                let id = Input::with_theme(&ui::get_theme())
+                    .with_prompt("Enter a unique ID for the thought")
+                    .interact()?;
+                
+                let title_str: String = Input::with_theme(&ui::get_theme())
+                    .with_prompt("Enter a title (optional, press Enter to skip)")
+                    .allow_empty(true)
+                    .interact()?;
+                
+                let title = if title_str.is_empty() { None } else { Some(title_str) };
+                
+                // Get content by opening an editor
+                let content = edit_in_external_editor("", "# Enter your thought content here")?;
+                
+                // Suggest tags based on existing ones
+                let tags = if tag_count > 0 {
+                    ui::select_tags(&graph, &[])?
+                } else {
+                    vec![]
+                };
+                
+                // Suggest references
+                let references = if thought_count > 0 {
+                    if ui::confirm("Would you like to add references to other thoughts?", false)? {
+                        let mut refs = Vec::new();
+                        while let Some(ref_id) = ui::select_thought(&graph, "Select a thought to reference (ESC to finish)")? {
+                            let notes = Input::with_theme(&ui::get_theme())
+                                .with_prompt("Add optional notes about this reference")
+                                .allow_empty(true)
+                                .interact()?;
+                            
+                            refs.push(Reference::new(
+                                ref_id,
+                                notes,
+                                Utc::now(),
+                            ));
+                        }
+                        refs
+                    } else {
+                        vec![]
+                    }
+                } else {
+                    vec![]
+                };
+                
+                // Create the thought
+                create_thought(&mut graph, Some(id), title, Some(content), 
+                    tags.iter().map(|t| t.id.clone()).collect(), 
+                    references.iter().map(|r| r.id.id.clone()).collect())
+            },
+            1 => {
+                // List thoughts
+                if tag_count > 0 && ui::confirm("Would you like to filter by tag?", false)? {
+                    let (tag_id, _) = ui::tag_selector(&graph)?;
+                    list_thoughts(&graph, Some(tag_id.id))
+                } else {
+                    list_thoughts(&graph, None)
+                }
+            },
+            2 => {
+                // View thought
+                if let Some(id) = ui::select_thought(&graph, "Select a thought to view")? {
+                    view_thought(&graph, &id.id)
+                } else {
+                    println!("No thought selected.");
+                    Ok(())
+                }
+            },
+            3 => {
+                // Edit thought
+                if let Some(id) = ui::select_thought(&graph, "Select a thought to edit")? {
+                    edit_thought(&mut graph, &id.id)
+                } else {
+                    println!("No thought selected.");
+                    Ok(())
+                }
+            },
+            4 => {
+                // Delete thought
+                if let Some(id) = ui::select_thought(&graph, "Select a thought to delete")? {
+                    delete_thought(&mut graph, &id.id, false)
+                } else {
+                    println!("No thought selected.");
+                    Ok(())
+                }
+            },
+            5 => {
+                // Tag a thought
+                if let Some(id) = ui::select_thought(&graph, "Select a thought to tag")? {
+                    let (tag_id, description) = ui::tag_selector(&graph)?;
+                    tag_thought(&mut graph, &id.id, &tag_id.id, description)
+                } else {
+                    println!("No thought selected.");
+                    Ok(())
+                }
+            },
+            6 => {
+                // Untag a thought
+                if let Some(id) = ui::select_thought(&graph, "Select a thought to untag")? {
+                    // Clone the necessary data to avoid borrow conflicts
+                    let thought_tags = match graph.get_thought(&id) {
+                        Some(thought) => thought.tags.clone(),
+                        None => {
+                            println!("Thought not found.");
+                            return Ok(());
+                        }
+                    };
+
+                    if thought_tags.is_empty() {
+                        println!("This thought has no tags.");
+                        Ok(())
+                    } else {
+                        let tag_items: Vec<String> = thought_tags.iter()
+                            .map(|tag_id| {
+                                let desc = graph.get_tag(tag_id)
+                                    .map(|tag| format!(" - {}", tag.description))
+                                    .unwrap_or_default();
+                                format!("#{}{}", tag_id.id, desc)
+                            })
+                            .collect();
+
+                        let selection = dialoguer::Select::with_theme(&ui::get_theme())
+                            .with_prompt("Select a tag to remove")
+                            .default(0)
+                            .items(&tag_items)
+                            .interact()?;
+
+                        untag_thought(&mut graph, &id.id, &thought_tags[selection].id)
+                    }
+                } else {
+                    println!("No thought selected.");
+                    Ok(())
+                }
+            },
+            7 => {
+                // Add reference
+                if thought_count < 2 {
+                    println!("You need at least two thoughts to create a reference.");
+                    Ok(())
+                } else {
+                    let from_id = ui::select_thought(&graph, "Select the source thought")?
+                        .ok_or_else(|| anyhow::anyhow!("No thought selected"))?;
+                    
+                    let to_id = ui::select_thought(&graph, "Select the target thought")?
+                        .ok_or_else(|| anyhow::anyhow!("No thought selected"))?;
+                    
+                    let notes: String = Input::with_theme(&ui::get_theme())
+                        .with_prompt("Add optional notes about this reference")
+                        .allow_empty(true)
+                        .interact()?;
+                    
+                    let notes = if notes.is_empty() { None } else { Some(notes) };
+                    
+                    add_reference(&mut graph, &from_id.id, &to_id.id, notes)
+                }
+            },
+            8 => {
+                // Search
+                let query: String = Input::with_theme(&ui::get_theme())
+                    .with_prompt("Enter search terms")
+                    .interact()?;
+                
+                search_thoughts(&graph, &query.split_whitespace().map(String::from).collect::<Vec<_>>())
+            },
+            9 => {
+                // Browse thoughts interactively
+                ui::browse_thoughts(&graph)
+            },
+            10 => {
+                // List tags
+                list_tags(&graph)
+            },
+            11 => {
+                // Visualize
+                let format_options = vec!["dot", "json"];
+                let format_selection = dialoguer::Select::with_theme(&ui::get_theme())
+                    .with_prompt("Select output format")
+                    .default(0)
+                    .items(&format_options)
+                    .interact()?;
+                
+                let format = format_options[format_selection];
+                
+                let depth = if ui::confirm("Would you like to customize graph depth?", false)? {
+                    let depth = dialoguer::Input::<usize>::with_theme(&ui::get_theme())
+                        .with_prompt("Enter depth (1-5)")
+                        .validate_with(|input: &usize| {
+                            if *input >= 1 && *input <= 5 {
+                                Ok(())
+                            } else {
+                                Err("Depth must be between 1 and 5")
+                            }
+                        })
+                        .default(1)
+                        .interact()?;
+                    depth
+                } else {
+                    1
+                };
+                
+                let use_file = ui::confirm("Would you like to save to a file?", true)?;
+                
+                let output = if use_file {
+                    let default_filename = format!("thoughtgraph.{}", format);
+                    let filename = dialoguer::Input::<String>::with_theme(&ui::get_theme())
+                        .with_prompt("Enter output filename")
+                        .default(default_filename)
+                        .interact()?;
+                    
+                    Some(PathBuf::from(filename))
+                } else {
+                    None
+                };
+                
+                visualize_graph(&graph, format, None, depth, output)
+            },
+            12 | _ => {
+                // Exit
+                if ui::confirm("Are you sure you want to exit?", false)? {
+                    return Ok(());
+                } else {
+                    Ok(())
+                }
+            }
+        };
+        
+        // Save graph changes if the command succeeded
+        if result.is_ok() {
+            ui::with_loading_progress("Saving changes...", || {
+                graph.save_to_file(file_path)
+            })?;
+
+            // Add a pause after successful commands so users can see the output
+            println!("\n{}", style("Press any key to continue...").dim());
+            term.read_key()?;
+        } else if let Err(e) = result {
+            println!("\n{}", style(format!("Error: {}", e)).red());
+            println!("Press any key to continue...");
+            term.read_key()?;
+        }
+
+        term.clear_screen()?;
+    }
 }
 
 fn main() -> Result<()> {
@@ -170,6 +454,11 @@ fn main() -> Result<()> {
     
     match cli.command {
         Commands::Init => init_graph(&file_path),
+        Commands::Interactive => interactive_mode(&file_path),
+        Commands::Browse => {
+            let graph = load_or_create_graph(&file_path)?;
+            ui::browse_thoughts(&graph)
+        },
         _ => {
             // For all other commands, load the existing graph or create a new one
             let mut graph = load_or_create_graph(&file_path)?;
@@ -189,12 +478,14 @@ fn main() -> Result<()> {
                 Commands::Tags => list_tags(&graph),
                 Commands::Visualize { format, focus, depth, output } => 
                     visualize_graph(&graph, &format, focus, depth, output),
-                Commands::Init => unreachable!(), // Handled above
+                Commands::Init | Commands::Interactive | Commands::Browse => unreachable!(), // Handled above
             };
             
             // Save graph changes if the command succeeded
             if result.is_ok() {
-                graph.save_to_file(&file_path)?;
+                ui::with_loading_progress("Saving changes...", || {
+                    graph.save_to_file(&file_path)
+                })?;
             }
             
             result
@@ -218,7 +509,9 @@ fn init_graph(file_path: &Path) -> Result<()> {
     }
     
     let graph = ThoughtGraph::default();
-    graph.save_to_file(file_path)?;
+    ui::with_loading_progress("Initializing new graph...", || {
+        graph.save_to_file(file_path)
+    })?;
     
     println!("Initialized a new thought graph at {}", file_path.display());
     Ok(())
@@ -227,12 +520,16 @@ fn init_graph(file_path: &Path) -> Result<()> {
 /// Load an existing graph or create a new one
 fn load_or_create_graph(file_path: &Path) -> Result<ThoughtGraph> {
     if file_path.exists() {
-        ThoughtGraph::load_from_file(file_path)
-            .context(format!("Failed to load thought graph from {}", file_path.display()))
+        ui::with_loading_progress("Loading thought graph...", || {
+            ThoughtGraph::load_from_file(file_path)
+                .context(format!("Failed to load thought graph from {}", file_path.display()))
+        })
     } else {
         println!("No thought graph found at {}. Creating a new one.", file_path.display());
         let graph = ThoughtGraph::default();
-        graph.save_to_file(file_path)?;
+        ui::with_loading_progress("Saving new thought graph...", || {
+            graph.save_to_file(file_path)
+        })?;
         Ok(graph)
     }
 }
@@ -330,16 +627,21 @@ fn create_thought(
     
     // Create the thought
     let thought_id = ThoughtID::new(id.clone());
-    graph.create_thought(
-        thought_id.clone(),
-        title,
-        content,
-        tag_ids,
-        refs,
-    )?;
+    
+    ui::with_loading_progress("Creating thought...", || {
+        graph.create_thought(
+            thought_id.clone(),
+            title,
+            content,
+            tag_ids,
+            refs,
+        )
+    })?;
     
     // Process any auto-references in the format [thought_id]
-    let auto_refs = graph.process_auto_references(&thought_id)?;
+    let auto_refs = ui::with_loading_progress("Processing auto-references...", || {
+        graph.process_auto_references(&thought_id)
+    })?;
     
     println!("Created thought '{}' successfully", id.green());
     
@@ -362,50 +664,25 @@ fn list_thoughts(graph: &ThoughtGraph, tag_filter: Option<String>) -> Result<()>
             if !graph.tags.contains_key(&tag_id) {
                 return Err(anyhow::anyhow!("Tag '{}' not found", tag));
             }
-            
+
             // Use the query functionality to find thoughts with this tag
             graph.find_thoughts(&thoughtgraph::Query::Tag(tag_id))
         },
         None => graph.thoughts.iter().map(|(id, thought)| (id, thought)).collect(),
     };
-    
-    if thoughts.is_empty() {
-        println!("No thoughts found");
-        return Ok(());
-    }
-    
-    println!("{:<20} {:<30} {:<20}", "ID", "TITLE", "UPDATED");
-    println!("{:-<20} {:-<30} {:-<20}", "", "", "");
-    
-    for (id, thought) in thoughts {
-        let title = thought.title.as_deref().unwrap_or("(Untitled)");
-        let date = thought.updated_at.format("%Y-%m-%d %H:%M");
-        
-        println!("{:<20} {:<30} {:<20}", 
-            id.id.blue(), 
-            title, 
-            date.to_string().dimmed()
-        );
-        
-        // Print truncated content
-        let preview = if thought.contents.len() > MAX_DISPLAY_LENGTH {
-            format!("{}...", &thought.contents[..MAX_DISPLAY_LENGTH])
-        } else {
-            thought.contents.clone()
-        };
-        println!("  {}", preview.dimmed());
-        
-        // Print tags
-        if !thought.tags.is_empty() {
-            let tag_list: Vec<String> = thought.tags.iter()
-                .map(|t| format!("#{}", t.id))
-                .collect();
-            println!("  {}", tag_list.join(" ").yellow());
+
+    // Use the enhanced display function
+    ui::display_thought_list(graph, &thoughts, MAX_DISPLAY_LENGTH)?;
+
+    // If in interactive mode, offer to select a thought to view
+    if io::stdin().is_terminal() && !thoughts.is_empty() {
+        if ui::confirm("Would you like to view one of these thoughts?", false)? {
+            if let Some(id) = ui::select_thought(graph, "Select a thought to view")? {
+                return view_thought(graph, &id.id);
+            }
         }
-        
-        println!();
     }
-    
+
     Ok(())
 }
 
@@ -415,65 +692,15 @@ fn view_thought(graph: &ThoughtGraph, id: &str) -> Result<()> {
     let thought = graph.get_thought(&thought_id)
         .ok_or_else(|| anyhow::anyhow!("Thought '{}' not found", id))?;
     
-    // Display header
-    if let Some(title) = &thought.title {
-        println!("{}", title.bold().green());
-    }
-    println!("ID: {}", id.blue());
+    // Use the enhanced display function
+    ui::display_thought_details(graph, &thought_id, thought)?;
     
-    // Display metadata
-    println!("Created: {}", thought.created_at.format("%Y-%m-%d %H:%M:%S").to_string().dimmed());
-    println!("Updated: {}", thought.updated_at.format("%Y-%m-%d %H:%M:%S").to_string().dimmed());
-    
-    // Display tags
-    if !thought.tags.is_empty() {
-        let tags: Vec<String> = thought.tags.iter()
-            .map(|t| {
-                let desc = graph.get_tag(t)
-                    .map(|tag| format!(" - {}", tag.description))
-                    .unwrap_or_default();
-                format!("#{}{}", t.id.yellow(), desc.dimmed())
-            })
-            .collect();
-        println!("\nTags:");
-        for tag in tags {
-            println!("  {}", tag);
+    // Ask if the user wants to explore related thoughts
+    if io::stdin().is_terminal() && !thought.references.is_empty() && graph.get_backlinks(&thought_id).len() > 0 {
+        if ui::confirm("Would you like to explore related thoughts?", false)? {
+            ui::browse_thoughts(graph)?;
         }
     }
-    
-    // Display references
-    if !thought.references.is_empty() {
-        println!("\nReferences:");
-        for reference in &thought.references {
-            let ref_id = &reference.id;
-            let title = graph.get_thought(ref_id)
-                .and_then(|t| t.title.clone())
-                .unwrap_or_else(|| "(Untitled)".to_string());
-            
-            println!("  → {} {}", ref_id.id.blue(), title);
-            if !reference.notes.is_empty() {
-                println!("    {}", reference.notes.dimmed());
-            }
-        }
-    }
-    
-    // Display backlinks
-    let backlinks = graph.get_backlinks(&thought_id);
-    if !backlinks.is_empty() {
-        println!("\nReferenced by:");
-        for backlink in backlinks {
-            let title = graph.get_thought(&backlink)
-                .and_then(|t| t.title.clone())
-                .unwrap_or_else(|| "(Untitled)".to_string());
-            
-            println!("  ← {} {}", backlink.id.blue(), title);
-        }
-    }
-    
-    // Display content
-    println!("\n{}", "─".repeat(80));
-    println!("{}", thought.contents);
-    println!("{}", "─".repeat(80));
     
     Ok(())
 }
@@ -540,13 +767,17 @@ fn edit_thought(graph: &mut ThoughtGraph, id: &str) -> Result<()> {
     updated_thought.update_title(title);
     updated_thought.update_content(content);
     
-    graph.command(&thoughtgraph::Command::PutThought {
-        id: thought_id.clone(),
-        thought: updated_thought,
+    ui::with_loading_progress("Updating thought...", || {
+        graph.command(&thoughtgraph::Command::PutThought {
+            id: thought_id.clone(),
+            thought: updated_thought,
+        });
     });
     
     // Process any auto-references in the format [thought_id]
-    let auto_refs = graph.process_auto_references(&thought_id)?;
+    let auto_refs = ui::with_loading_progress("Processing auto-references...", || {
+        graph.process_auto_references(&thought_id)
+    })?;
     
     println!("Thought '{}' updated successfully", id.green());
     
@@ -573,12 +804,7 @@ fn delete_thought(graph: &mut ThoughtGraph, id: &str, force: bool) -> Result<()>
     // Confirm deletion if not forced
     if !force {
         if io::stdin().is_terminal() {
-            let confirm = dialoguer::Confirm::new()
-                .with_prompt(format!("Are you sure you want to delete thought '{}'?", id))
-                .default(false)
-                .interact()?;
-            
-            if !confirm {
+            if !ui::confirm(&format!("Are you sure you want to delete thought '{}'?", id), false)? {
                 println!("Deletion cancelled");
                 return Ok(());
             }
@@ -588,9 +814,11 @@ fn delete_thought(graph: &mut ThoughtGraph, id: &str, force: bool) -> Result<()>
         }
     }
     
-    // Delete the thought
-    graph.command(&thoughtgraph::Command::DeleteThought {
-        id: thought_id.clone(),
+    // Delete the thought with progress indicator
+    ui::with_loading_progress(&format!("Deleting thought '{}'...", id), || {
+        graph.command(&thoughtgraph::Command::DeleteThought {
+            id: thought_id.clone(),
+        });
     });
     
     println!("Thought '{}' deleted successfully", id.green());
@@ -612,21 +840,25 @@ fn tag_thought(graph: &mut ThoughtGraph, id: &str, tag: &str, description: Optio
     if !graph.tags.contains_key(&tag_id) {
         let desc = match description {
             Some(d) => d,
-            None => Input::<String>::new()
+            None => Input::with_theme(&ui::get_theme())
                 .with_prompt(format!("Enter description for new tag '{}'", tag))
                 .interact()?,
         };
         
-        graph.create_tag(tag_id.clone(), desc)?;
+        ui::with_loading_progress("Creating tag...", || {
+            graph.create_tag(tag_id.clone(), desc)
+        })?;
     }
     
     // Add the tag to the thought
     let mut updated_thought = thought.clone();
-    updated_thought.add_tag(tag_id);
+    updated_thought.add_tag(tag_id.clone());
     
-    graph.command(&thoughtgraph::Command::PutThought {
-        id: thought_id,
-        thought: updated_thought,
+    ui::with_loading_progress("Updating thought...", || {
+        graph.command(&thoughtgraph::Command::PutThought {
+            id: thought_id.clone(),
+            thought: updated_thought,
+        });
     });
     
     println!("Added tag '{}' to thought '{}'", tag.yellow(), id.green());
@@ -644,13 +876,20 @@ fn untag_thought(graph: &mut ThoughtGraph, id: &str, tag: &str) -> Result<()> {
         None => return Err(anyhow::anyhow!("Thought '{}' not found", id)),
     };
     
+    // Check if the thought actually has this tag
+    if !thought.tags.contains(&tag_id) {
+        return Err(anyhow::anyhow!("Thought '{}' doesn't have tag '{}'", id, tag));
+    }
+    
     // Remove the tag from the thought
     let mut updated_thought = thought.clone();
     updated_thought.remove_tag(&tag_id);
     
-    graph.command(&thoughtgraph::Command::PutThought {
-        id: thought_id,
-        thought: updated_thought,
+    ui::with_loading_progress("Updating thought...", || {
+        graph.command(&thoughtgraph::Command::PutThought {
+            id: thought_id.clone(),
+            thought: updated_thought,
+        });
     });
     
     println!("Removed tag '{}' from thought '{}'", tag.yellow(), id.green());
@@ -683,9 +922,11 @@ fn add_reference(graph: &mut ThoughtGraph, from: &str, to: &str, notes: Option<S
     let mut updated_thought = from_thought.clone();
     updated_thought.add_reference(reference);
     
-    graph.command(&thoughtgraph::Command::PutThought {
-        id: from_id,
-        thought: updated_thought,
+    ui::with_loading_progress("Adding reference...", || {
+        graph.command(&thoughtgraph::Command::PutThought {
+            id: from_id.clone(),
+            thought: updated_thought,
+        });
     });
     
     println!("Added reference from '{}' to '{}'", from.green(), to.green());
@@ -702,16 +943,21 @@ fn search_thoughts(graph: &ThoughtGraph, query_terms: &[String]) -> Result<()> {
         .map(|s| s.to_lowercase())
         .collect();
     
-    // Simple search in titles and contents
-    let matching_thoughts: Vec<(&ThoughtID, &Thought)> = graph.thoughts.iter()
-        .filter(|(_, thought)| {
-            let title_text = thought.title.clone().unwrap_or_default().to_lowercase();
-            let content_text = thought.contents.to_lowercase();
-            let combined_text = format!("{} {}", title_text, content_text);
-            
-            search_terms.iter().all(|term| combined_text.contains(term))
-        })
-        .collect();
+    println!("Searching for: {}", search_terms.join(" ").cyan());
+    
+    // Create a progress bar for the search operation
+    let matching_thoughts = ui::with_loading_progress("Searching thoughts...", || {
+        // Simple search in titles and contents
+        graph.thoughts.iter()
+            .filter(|(_, thought)| {
+                let title_text = thought.title.clone().unwrap_or_default().to_lowercase();
+                let content_text = thought.contents.to_lowercase();
+                let combined_text = format!("{} {}", title_text, content_text);
+                
+                search_terms.iter().all(|term| combined_text.contains(term))
+            })
+            .collect::<Vec<(&ThoughtID, &Thought)>>()
+    });
     
     if matching_thoughts.is_empty() {
         println!("No thoughts found matching query: {}", search_terms.join(" "));
@@ -719,28 +965,19 @@ fn search_thoughts(graph: &ThoughtGraph, query_terms: &[String]) -> Result<()> {
     }
     
     println!("Found {} matching thoughts", matching_thoughts.len());
-    println!("{:<20} {:<30} {:<20}", "ID", "TITLE", "UPDATED");
-    println!("{:-<20} {:-<30} {:-<20}", "", "", "");
     
-    for (id, thought) in matching_thoughts {
-        let title = thought.title.as_deref().unwrap_or("(Untitled)");
-        let date = thought.updated_at.format("%Y-%m-%d %H:%M");
-        
-        println!("{:<20} {:<30} {:<20}", 
-            id.id.blue(), 
-            title, 
-            date.to_string().dimmed()
-        );
-        
-        // Print truncated content
-        let preview = if thought.contents.len() > MAX_DISPLAY_LENGTH {
-            format!("{}...", &thought.contents[..MAX_DISPLAY_LENGTH])
-        } else {
-            thought.contents.clone()
-        };
-        println!("  {}", preview.dimmed());
-        
-        println!();
+    // Display results with enhanced formatting
+    ui::display_thought_list(graph, &matching_thoughts, MAX_DISPLAY_LENGTH)?;
+    
+    // If in interactive mode, allow selecting a thought to view
+    if io::stdin().is_terminal() && !matching_thoughts.is_empty() {
+        if ui::confirm("Would you like to view one of these thoughts?", true)? {
+            let selected_id = ui::select_thought(graph, "Select a thought to view")?;
+            
+            if let Some(thought_id) = selected_id {
+                return view_thought(graph, &thought_id.id);
+            }
+        }
     }
     
     Ok(())
@@ -751,24 +988,55 @@ fn list_tags(graph: &ThoughtGraph) -> Result<()> {
     let tags: Vec<(&TagID, &Tag)> = graph.tags.iter().collect();
     
     if tags.is_empty() {
-        println!("No tags found");
+        println!("{}", style("No tags found").italic());
         return Ok(());
     }
     
-    println!("{:<20} {:<40} {:<10}", "TAG", "DESCRIPTION", "COUNT");
-    println!("{:-<20} {:-<40} {:-<10}", "", "", "");
+    // Display tags with enhanced formatting
+    println!("{} {} {}",
+        style(ui::format_column("TAG", 20)).bold().underlined(),
+        style(ui::format_column("DESCRIPTION", 40)).bold().underlined(),
+        style(ui::format_column("COUNT", 10)).bold().underlined()
+    );
     
-    for (id, tag) in tags {
-        // Count thoughts with this tag
-        let count = graph.thoughts.values()
-            .filter(|thought| thought.tags.contains(id))
-            .count();
+    // Pre-compute counts to avoid repeated iterations
+    let counts = ui::with_loading_progress("Counting tag usage...", || {
+        tags.iter().map(|(id, _)| {
+            let count = graph.thoughts.values()
+                .filter(|thought| thought.tags.contains(*id))
+                .count();
+            ((*id).clone(), count)
+        }).collect::<HashMap<_, _>>()
+    });
+
+    for (id, tag) in &tags {
+        let count = counts.get(id).unwrap_or(&0);
         
-        println!("{:<20} {:<40} {:<10}", 
-            format!("#{}", id.id).yellow(),
-            tag.description,
-            count
+        println!("{} {} {}",
+            style(ui::format_column(&format!("#{}", id.id), 20)).yellow(),
+            style(ui::format_column(&tag.description, 40)),
+            style(ui::format_column(&count.to_string(), 10))
         );
+    }
+    
+    // If in interactive mode, offer to view thoughts with a specific tag
+    if io::stdin().is_terminal() && !tags.is_empty() {
+        if ui::confirm("Would you like to view thoughts with a specific tag?", false)? {
+            let tag_items: Vec<String> = tags.iter()
+                .map(|(id, tag)| format!("#{} - {}", id.id, tag.description))
+                .collect();
+            
+            let selection = dialoguer::Select::with_theme(&ui::get_theme())
+                .with_prompt("Select a tag")
+                .default(0)
+                .items(&tag_items)
+                .interact_opt()?;
+            
+            if let Some(idx) = selection {
+                let selected_tag = &tags[idx].0.id;
+                return list_thoughts(graph, Some(selected_tag.clone()));
+            }
+        }
     }
     
     Ok(())
@@ -782,31 +1050,57 @@ fn visualize_graph(
     depth: usize,
     output: Option<PathBuf>,
 ) -> Result<()> {
-    // Generate graph data based on whether we have a focused thought or not
-    let graph_data = if let Some(focus_id_str) = focus {
-        let focus_id = ThoughtID::new(focus_id_str.clone());
-        
-        // Check if the focused thought exists
-        if !graph.thoughts.contains_key(&focus_id) {
-            return Err(anyhow::anyhow!("Thought '{}' not found", focus_id_str));
+    // If focus is not provided but we're in interactive mode, offer to select a focus
+    let focus_id_str = if focus.is_none() && io::stdin().is_terminal() && !graph.thoughts.is_empty() {
+        if ui::confirm("Would you like to focus on a specific thought?", true)? {
+            match ui::select_thought(graph, "Select a thought to focus on")? {
+                Some(id) => Some(id.id),
+                None => None
+            }
+        } else {
+            None
         }
-        
-        generate_focused_graph(graph, &focus_id, depth)
     } else {
-        generate_graph_data(graph)
+        focus
     };
     
+    // Generate graph data with progress indicator
+    let graph_data = ui::with_loading_progress("Generating graph visualization...", || {
+        if let Some(focus_str) = &focus_id_str {
+            let focus_id = ThoughtID::new(focus_str.clone());
+            
+            // Check if the focused thought exists
+            if !graph.thoughts.contains_key(&focus_id) {
+                return Err(anyhow::anyhow!("Thought '{}' not found", focus_str));
+            }
+            
+            Ok(generate_focused_graph(graph, &focus_id, depth))
+        } else {
+            Ok(generate_graph_data(graph))
+        }
+    })?;
+    
     // Generate output in the requested format
-    let output_text = match format.to_lowercase().as_str() {
+    let format = format.to_lowercase();
+    let output_text = match format.as_str() {
         "dot" => graph_data.to_dot(),
         "json" => graph_data.to_json(),
         _ => return Err(anyhow::anyhow!("Unsupported visualization format: {}. Use 'dot' or 'json'.", format)),
     };
     
-    // Output to file or stdout
+    // Output to file or stdout with progress indicator
     if let Some(output_path) = output {
-        fs::write(&output_path, output_text)?;
-        println!("Visualization saved to {}", output_path.display());
+        ui::with_loading_progress(&format!("Saving {} visualization to file...", format), || {
+            fs::write(&output_path, &output_text)
+        })?;
+        
+        println!("{}", style(format!("Visualization saved to {}", output_path.display())).green());
+        
+        // If it's a dot file, suggest using Graphviz
+        if format == "dot" {
+            println!("\nTip: To render this file with Graphviz, run:");
+            println!("  dot -Tpng {} -o graph.png", output_path.display());
+        }
     } else {
         println!("{}", output_text);
     }
