@@ -138,17 +138,17 @@ enum Commands {
     /// Visualize the thought graph
     Visualize {
         /// Format for visualization (dot or json)
-        #[arg(short, long, default_value = "dot")]
+        #[arg(short = 'm', long, default_value = "dot")]
         format: String,
-        
+
         /// Focus visualization on a specific thought
         #[arg(short, long)]
         focus: Option<String>,
-        
+
         /// Depth limit for focused visualization (default: 1)
         #[arg(short, long, default_value = "1")]
         depth: usize,
-        
+
         /// Output file (if not specified, outputs to stdout)
         #[arg(short, long)]
         output: Option<PathBuf>,
